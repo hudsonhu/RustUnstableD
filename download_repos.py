@@ -8,9 +8,9 @@ from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 import threading
-
+import time
 
 # --------- 工具与数据结构 ---------
 
@@ -59,10 +59,9 @@ def parse_github_repo(repository: str) -> Optional[Tuple[str, str, str]]:
         return None
     s = repository.strip()
 
-    # 特例：SSH 形式 git@github.com:owner/repo.git
+    # SSH 形式 git@github.com:owner/repo.git
     if s.startswith("git@github.com:"):
         tail = s[len("git@github.com:"):]
-        # 去掉可能的 .git 和尾部杂项
         tail = tail.split("#", 1)[0].split("?", 1)[0]
         if tail.endswith(".git"):
             tail = tail[:-4]
@@ -73,7 +72,6 @@ def parse_github_repo(repository: str) -> Optional[Tuple[str, str, str]]:
         normalized = f"https://github.com/{owner}/{repo}.git"
         return owner, repo, normalized
 
-    # 正常 URL / 裸域名
     lower = s.lower()
     if "github.com" not in lower:
         return None
@@ -100,7 +98,6 @@ def parse_github_repo(repository: str) -> Optional[Tuple[str, str, str]]:
         return None
     owner, repo = parts[0], parts[1]
 
-    # 去掉 .git
     if repo.endswith(".git"):
         repo = repo[:-4]
 
@@ -112,28 +109,47 @@ def parse_github_repo(repository: str) -> Optional[Tuple[str, str, str]]:
 
 def load_jobs_from_sample(csv_path: str, out_dir: str) -> Dict[str, RepoJob]:
     """
-    从 sampled_crates.csv 读取数据，根据 repository 字段解析 GitHub 仓库，
+    从 sampled_crates*.csv 读取数据，根据 repository 字段解析 GitHub 仓库，
     聚合成 RepoJob（一个 repo 可能对应多个 crate）。
-    返回 dict: key -> RepoJob
+
+    兼容两种列名：
+      - 旧版: pop_stratum
+      - 新版: popularity_band
     """
     jobs: Dict[str, RepoJob] = {}
 
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        required_cols = ["name", "repository", "top_category", "pop_stratum"]
+        fieldnames = reader.fieldnames or []
+
+        # 基础必需列
+        required_cols = ["name", "repository", "top_category"]
         for c in required_cols:
-            if c not in reader.fieldnames:
+            if c not in fieldnames:
                 raise RuntimeError(f"sample CSV missing column: {c}")
+
+        # 兼容旧字段名 pop_stratum 和 新字段名 popularity_band
+        pop_field = None
+        if "pop_stratum" in fieldnames:
+            pop_field = "pop_stratum"
+        elif "popularity_band" in fieldnames:
+            pop_field = "popularity_band"
+        else:
+            log("[WARN] sample CSV has no 'pop_stratum' or 'popularity_band'; "
+                "will treat all as 'unknown'.")
 
         for row in reader:
             crate_name = (row.get("name") or "").strip()
             repo_url = (row.get("repository") or "").strip()
             top_category = (row.get("top_category") or "").strip() or "unknown"
-            pop_stratum = (row.get("pop_stratum") or "").strip() or "unknown"
+
+            if pop_field is not None:
+                pop_stratum = (row.get(pop_field) or "").strip() or "unknown"
+            else:
+                pop_stratum = "unknown"
 
             parsed = parse_github_repo(repo_url)
             if parsed is None:
-                # 非 github 或格式怪，先跳过
                 continue
             owner, repo, git_url = parsed
             key = f"{owner}/{repo}"
@@ -207,7 +223,7 @@ def load_status(status_path: str, jobs: Dict[str, RepoJob]) -> Dict[str, RepoSta
 
 def save_status(status_path: str, status: Dict[str, RepoStatus]):
     """
-    把 status 写回 CSV。每次写全量，反正几百行很小。
+    把 status 写回 CSV。每次写全量，顺带把 last_error 里的换行清理掉。
     """
     tmp_path = status_path + ".tmp"
     fieldnames = [
@@ -224,13 +240,21 @@ def save_status(status_path: str, status: Dict[str, RepoStatus]):
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for key in sorted(status.keys()):
-            writer.writerow(asdict(status[key]))
+            st = status[key]
+            row = asdict(st)
+            le = row.get("last_error") or ""
+            if le:
+                le = le.replace("\r", " ").replace("\n", " | ")
+                if len(le) > 300:
+                    le = le[-300:]
+                row["last_error"] = le
+            writer.writerow(row)
     os.replace(tmp_path, status_path)
 
 
 # --------- Git 操作 ---------
 
-def run_git(args: List[str], cwd: Optional[str] = None) -> Tuple[int, str, str]:
+def run_git(args: List[str], cwd: Optional[str] = None, timeout: Optional[int] = None) -> Tuple[int, str, str]:
     """
     运行 git 命令，返回 (returncode, stdout, stderr)。
     """
@@ -241,51 +265,83 @@ def run_git(args: List[str], cwd: Optional[str] = None) -> Tuple[int, str, str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        timeout=timeout,
     )
     return result.returncode, result.stdout, result.stderr
+
+
+def get_dir_size(path: str) -> int:
+    """
+    粗略统计目录大小（字节）。用于估算下载量和速度。
+    """
+    total = 0
+    for root, dirs, files in os.walk(path):
+        for name in files:
+            fp = os.path.join(root, name)
+            try:
+                total += os.path.getsize(fp)
+            except OSError:
+                pass
+    return total
 
 
 def clone_or_update_repo(
     job: RepoJob,
     shallow: bool,
     update_existing: bool,
-) -> None:
+    timeout: Optional[int],
+) -> Tuple[int, float]:
     """
     如果本地没有仓库，执行 git clone。
     如果本地有仓库：
       - update_existing=True: git fetch --all --prune --tags
       - update_existing=False: 直接视为成功
-    出错则抛异常，让上层记录失败。
+    返回 (repo_size_bytes, elapsed_seconds)。
     """
     path = job.local_path
+    t0 = time.time()
+
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         args = ["clone"]
         if shallow:
             args += ["--depth", "1"]
         args += [job.git_url, path]
-        rc, out, err = run_git(args)
+        rc, out, err = run_git(args, timeout=timeout)
         if rc != 0:
-            raise RuntimeError(f"git clone failed: {err.strip()[-500:]}")
-        return
+            msg = (err or out or "").strip()
+            msg = msg.replace("\r", " ").replace("\n", " | ")
+            if len(msg) > 300:
+                msg = msg[-300:]
+            raise RuntimeError(f"git clone failed: {msg}")
+        # clone 完成后统计目录大小
+        size = get_dir_size(path)
+        elapsed = time.time() - t0
+        return size, elapsed
 
     # 目录已存在
     git_dir = os.path.join(path, ".git")
     if not os.path.isdir(git_dir):
-        raise RuntimeError(
-            f"Target path exists but is not a git repo: {path}"
-        )
+        raise RuntimeError(f"Target path exists but is not a git repo: {path}")
 
     if not update_existing:
-        # 用户指定不更新，直接视为 success
-        return
+        # 不更新，直接认为成功，大小就当前目录大小
+        size = get_dir_size(path)
+        elapsed = time.time() - t0
+        return size, elapsed
 
     # 更新已有仓库
-    rc, out, err = run_git(["fetch", "--all", "--prune", "--tags"], cwd=path)
+    rc, out, err = run_git(["fetch", "--all", "--prune", "--tags"], cwd=path, timeout=timeout)
     if rc != 0:
-        raise RuntimeError(f"git fetch failed: {err.strip()[-500:]}")
-    # 可以慎重点，只 fetch，不强制 pull；以后分析用 fetch 足够
-    return
+        msg = (err or out or "").strip()
+        msg = msg.replace("\r", " ").replace("\n", " | ")
+        if len(msg) > 300:
+            msg = msg[-300:]
+        raise RuntimeError(f"git fetch failed: {msg}")
+
+    size = get_dir_size(path)
+    elapsed = time.time() - t0
+    return size, elapsed
 
 
 # --------- Worker 逻辑 ---------
@@ -295,17 +351,23 @@ def worker_job(
     status_record: RepoStatus,
     shallow: bool,
     update_existing: bool,
-) -> Tuple[str, bool, str]:
+    timeout: Optional[int],
+) -> Tuple[str, bool, str, int, float]:
     """
     供线程池调用。
-    返回 (key, success, error_message)。
+    返回 (key, success, error_message, repo_size_bytes, elapsed_seconds)。
     """
     key = job.key
     try:
-        clone_or_update_repo(job, shallow=shallow, update_existing=update_existing)
-        return key, True, ""
+        size, elapsed = clone_or_update_repo(
+            job,
+            shallow=shallow,
+            update_existing=update_existing,
+            timeout=timeout,
+        )
+        return key, True, "", size, elapsed
     except Exception as e:
-        return key, False, str(e)
+        return key, False, str(e), 0, 0.0
 
 
 # --------- 主流程 ---------
@@ -356,6 +418,12 @@ def main(argv=None):
         action="store_true",
         help="If set, re-run even repos marked as success in status file.",
     )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=600,
+        help="Timeout for each git operation in seconds (default: 600).",
+    )
     args = parser.parse_args(argv)
 
     out_dir = args.out_dir
@@ -370,16 +438,15 @@ def main(argv=None):
 
     shallow = args.shallow
     update_existing = not args.no_update_existing
+    timeout = args.timeout_seconds if args.timeout_seconds > 0 else None
 
     # 选择需要执行的 job
     to_run: List[Tuple[RepoJob, RepoStatus]] = []
     for key, job in jobs.items():
         st = status[key]
-        # 判断是否需要执行
         if st.status == "success" and not args.redo_success:
             continue
         if st.attempts >= args.max_retries and st.status == "failed":
-            # 超过最大重试次数，跳过
             continue
         to_run.append((job, st))
 
@@ -395,7 +462,9 @@ def main(argv=None):
         with lock:
             st = status[key]
             st.attempts += 1
-            st.last_attempt_ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            # timezone-aware UTC 时间
+            ts = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+            st.last_attempt_ts = ts
             if success:
                 st.status = "success"
                 st.last_error = ""
@@ -404,7 +473,14 @@ def main(argv=None):
                 st.last_error = error_msg
             save_status(args.status_file, status)
 
-    # 线程池执行
+    total_to_run = len(to_run)
+    global_start = time.time()
+    completed = 0
+    succ = 0
+    fail = 0
+    total_bytes = 0
+
+    log("Starting worker pool ...")
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         future_to_key = {}
         for job, st in to_run:
@@ -414,6 +490,7 @@ def main(argv=None):
                 st,
                 shallow,
                 update_existing,
+                timeout,
             )
             future_to_key[future] = job.key
 
@@ -421,27 +498,57 @@ def main(argv=None):
             for future in as_completed(future_to_key):
                 key = future_to_key[future]
                 try:
-                    key, success, error_msg = future.result()
+                    key, success, error_msg, size_bytes, elapsed = future.result()
                 except Exception as e:
-                    # 理论上不会到这里，因为 worker 已 catch，保险起见
                     success = False
                     error_msg = f"worker exception: {e}"
+                    size_bytes = 0
+                    elapsed = 0.0
+
+                completed += 1
                 if success:
-                    log(f"[OK] {key}")
+                    succ += 1
                 else:
-                    log(f"[FAIL] {key} | {error_msg}")
+                    fail += 1
+
+                if size_bytes > 0 and elapsed > 0:
+                    repo_mb = size_bytes / (1024 * 1024)
+                    repo_speed = repo_mb / elapsed
+                else:
+                    repo_mb = 0.0
+                    repo_speed = 0.0
+
+                total_bytes += size_bytes
+                total_elapsed = max(time.time() - global_start, 1e-6)
+                total_mb = total_bytes / (1024 * 1024)
+                total_speed = total_mb / total_elapsed
+
+                # 进度行：总体进度 + 当前仓库信息 + 当前仓库平均速度 + 全局平均速度
+                if success:
+                    state_tag = "OK"
+                else:
+                    state_tag = "FAIL"
+
+                log(
+                    f"[{state_tag}] {key} | "
+                    f"{completed}/{total_to_run} done "
+                    f"(success={succ}, failed={fail}) | "
+                    f"repo ~{repo_mb:.2f} MB @ {repo_speed:.2f} MB/s | "
+                    f"total ~{total_mb:.2f} MB @ {total_speed:.2f} MB/s"
+                )
+
                 update_status_and_save(key, success, error_msg)
         except KeyboardInterrupt:
             log("Interrupted by user (Ctrl+C). Waiting for running tasks to finish...")
-            # 线程池会在 with 退出时等待已提交任务
-            # 状态文件已经在每个任务完成时持续刷盘
             raise
 
-    # 总结一下
-    succ = sum(1 for st in status.values() if st.status == "success")
-    fail = sum(1 for st in status.values() if st.status == "failed")
     pend = sum(1 for st in status.values() if st.status == "pending")
     log(f"Done. success={succ}, failed={fail}, pending={pend}")
+    total_elapsed = max(time.time() - global_start, 1e-6)
+    total_mb = total_bytes / (1024 * 1024)
+    total_speed = total_mb / total_elapsed
+    log(f"Total downloaded/processed ~{total_mb:.2f} MB in {total_elapsed:.1f} s "
+        f"({total_speed:.2f} MB/s)")
 
 
 if __name__ == "__main__":

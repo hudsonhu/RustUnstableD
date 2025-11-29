@@ -1,29 +1,45 @@
 #!/usr/bin/env python3
+"""
+sample_crates.py
+
+Two-layer sampling for Rust crates:
+
+1) Core stratum (infrastructure crates, selected with certainty):
+   - Top N crates by reverse dependencies (default: 300)
+   - Plus optional extra names from a core list CSV (--core-list)
+
+2) Non-core stratum (all remaining crates):
+   - Filter by minimum downloads and recency
+   - Stratified random sampling by (top_category, popularity_band)
+   - Popularity bands are based on non-core downloads quantiles (p50, p90)
+
+Output: a CSV of sampled crates, including core + non-core, with labels
+and a `repository` column so that download_repos.py can clone them.
+
+Example:
+
+    python3 sample_crates.py \
+      --dump ./db-dump.tar.gz \
+      --out ./sampled_crates_v2.csv \
+      --target-size 1500 \
+      --core-top-revdeps 300 \
+      --min-downloads-noncore 100 \
+      --min-latest-year-noncore 2015 \
+      --seed 42
+
+"""
+
 import argparse
 import csv
-import io
-import os
+import math
 import random
-import sys
 import tarfile
-from collections import defaultdict, Counter
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
 
-
-# ---------- 小工具 ----------
-# --- 关键补丁：放大 CSV 单元格大小限制 ---
-# crates.csv 里有很长的字段（比如说明文档），默认 128KB 不够用，
-# 我们把它调到接近系统允许的最大值。
-max_int = sys.maxsize
-while True:
-    try:
-        csv.field_size_limit(max_int)
-        break
-    except OverflowError:
-        max_int = int(max_int / 10)
-# --- 补丁到此结束 ---
-
+# Avoid "field larger than field limit" on crates.csv descriptions
+csv.field_size_limit(2**31 - 1)
 
 
 @dataclass
@@ -31,473 +47,628 @@ class CrateMeta:
     crate_id: int
     name: str
     repository: str
+    created_at: str
+    latest_version_created_at: str
+    latest_version_year: Optional[int]
     downloads: int
+    revdeps: int
     top_category: str
-    all_categories: str
-    created_year: Optional[int]
-    updated_year: Optional[int]
-    pop_stratum: str  # "high" / "mid" / "low"
 
 
 def log(msg: str):
-    """简单的日志输出，方便确认脚本在运行。"""
-    print(f"[sample_crates] {msg}")
+    print(msg, flush=True)
 
 
-def parse_year(date_str: Optional[str]) -> Optional[int]:
-    """从日期字符串中取年份（YYYY...）。"""
-    if not date_str:
-        return None
-    if len(date_str) >= 4 and date_str[:4].isdigit():
-        return int(date_str[:4])
-    return None
-
-
-def find_member(tar: tarfile.TarFile, suffix: str) -> Optional[tarfile.TarInfo]:
-    """在 tar 里找到以某个后缀结尾的成员（例如 crates.csv）。"""
-    for m in tar.getmembers():
-        if m.name.endswith(suffix):
+def find_member(tf: tarfile.TarFile, basename: str) -> tarfile.TarInfo:
+    """
+    Find a CSV file in the tarball by basename.
+    The dump may put files in the root or in a subdir (e.g. 'data/crates.csv').
+    """
+    for m in tf.getmembers():
+        if m.name.endswith("/" + basename) or m.name == basename:
             return m
-    return None
+    raise FileNotFoundError(f"Could not find {basename} in tarball")
 
 
-def read_csv_from_tar(
-    tar: tarfile.TarFile,
-    suffix: str,
-    required_columns: List[str],
-) -> List[Dict[str, str]]:
-    """从 db-dump 中读取 CSV，并检查列是否存在。"""
-    member = find_member(tar, suffix)
-    if member is None:
-        raise RuntimeError(
-            f"Could not find {suffix} inside db-dump tarball. "
-            "Make sure you downloaded the official crates.io DB dump."
-        )
-    f = tar.extractfile(member)
-    if f is None:
-        raise RuntimeError(f"Could not extract {suffix} from tarball.")
-    with io.TextIOWrapper(f, encoding="utf-8") as text:
-        reader = csv.DictReader(text)
-        if reader.fieldnames is None:
-            raise RuntimeError(f"{suffix} has no header row.")
-        missing = [c for c in required_columns if c not in reader.fieldnames]
-        if missing:
-            raise RuntimeError(
-                f"{suffix} is missing expected columns: {missing}. "
-                "The DB dump format may have changed; please update the script."
-            )
-        rows = list(reader)
-    return rows
+def load_crates(tf: tarfile.TarFile) -> Dict[int, Dict]:
+    """
+    Load crates.csv: {id: {"name": str, "created_at": str, "repository": str}}
+    """
+    log("[sample_crates] Reading crates.csv ...")
+    crates_member = find_member(tf, "crates.csv")
+    crates: Dict[int, Dict] = {}
+    with tf.extractfile(crates_member) as f:
+        reader = csv.DictReader((line.decode("utf-8") for line in f))
+        for row in reader:
+            try:
+                cid = int(row["id"])
+            except (KeyError, ValueError):
+                continue
+            crates[cid] = {
+                "name": row.get("name", ""),
+                "created_at": row.get("created_at", ""),
+                "repository": row.get("repository", "") or "",
+            }
+    return crates
 
 
-# ---------- 载入 DB DUMP ----------
+def load_downloads(tf: tarfile.TarFile) -> Dict[int, int]:
+    """
+    Load crate_downloads.csv: sum downloads per crate_id.
+    """
+    log("[sample_crates] Reading crate_downloads.csv ...")
+    member = find_member(tf, "crate_downloads.csv")
+    downloads: Dict[int, int] = defaultdict(int)
+    with tf.extractfile(member) as f:
+        reader = csv.DictReader((line.decode("utf-8") for line in f))
+        for row in reader:
+            try:
+                cid = int(row["crate_id"])
+                d = int(row["downloads"])
+            except (KeyError, ValueError):
+                continue
+            downloads[cid] += d
+    return downloads
 
-def load_metadata_from_dump(dump_path: str):
-    """从 db-dump.tar.gz 里读出我们需要的几张表。"""
-    if not os.path.exists(dump_path):
-        raise FileNotFoundError(
-            f"DB dump file {dump_path!r} not found. "
-            "Download it from https://static.crates.io/db-dump.tar.gz "
-            "and pass its path via --dump."
-        )
 
-    log(f"Opening DB dump: {dump_path}")
-    with tarfile.open(dump_path, "r:gz") as tar:
-        log("Reading crates.csv ...")
-        crates_rows = read_csv_from_tar(
-            tar,
-            "crates.csv",
-            ["id", "name", "created_at", "updated_at", "repository"],
-        )
+def load_reverse_deps(tf: tarfile.TarFile) -> Dict[int, int]:
+    """
+    Load dependencies.csv and count how many times each crate_id is depended on.
+    This is a rough measure of reverse dependencies (dependency edges).
+    """
+    log("[sample_crates] Reading dependencies.csv (for reverse deps) ...")
+    member = find_member(tf, "dependencies.csv")
+    revdeps: Dict[int, int] = defaultdict(int)
+    with tf.extractfile(member) as f:
+        reader = csv.DictReader((line.decode("utf-8") for line in f))
+        for row in reader:
+            try:
+                cid = int(row["crate_id"])
+            except (KeyError, ValueError):
+                continue
+            revdeps[cid] += 1
+    return revdeps
 
-        log("Reading crate_downloads.csv ...")
-        crate_downloads_rows = read_csv_from_tar(
-            tar,
-            "crate_downloads.csv",
-            ["crate_id", "downloads"],
-        )
 
-        log("Reading categories.csv / crates_categories.csv ...")
-        categories_rows = read_csv_from_tar(
-            tar,
-            "categories.csv",
-            ["id", "slug"],
-        )
-        crates_categories_rows = read_csv_from_tar(
-            tar,
-            "crates_categories.csv",
-            ["crate_id", "category_id"],
-        )
+def load_versions_latest_year(tf: tarfile.TarFile) -> Dict[int, Tuple[str, Optional[int]]]:
+    """
+    Load versions.csv and compute, for each crate_id:
+      - latest_version_created_at (string)
+      - latest_version_year (int or None)
+    We use max(created_at) as a proxy for "recent activity".
+    """
+    log("[sample_crates] Scanning versions.csv for latest version dates ...")
+    member = find_member(tf, "versions.csv")
+    latest_created: Dict[int, str] = {}
+    with tf.extractfile(member) as f:
+        reader = csv.DictReader((line.decode("utf-8") for line in f))
+        for row in reader:
+            try:
+                cid = int(row["crate_id"])
+            except (KeyError, ValueError):
+                continue
+            created_at = row.get("created_at", "") or ""
+            if not created_at:
+                continue
+            # Simple string comparison works for ISO-like timestamps
+            prev = latest_created.get(cid)
+            if prev is None or created_at > prev:
+                latest_created[cid] = created_at
 
-        log("Reading default_versions.csv ...")
-        default_versions_rows = read_csv_from_tar(
-            tar,
-            "default_versions.csv",
-            ["crate_id", "version_id", "num_versions"],
-        )
+    result: Dict[int, Tuple[str, Optional[int]]] = {}
+    for cid, ts in latest_created.items():
+        year = None
+        if len(ts) >= 4 and ts[:4].isdigit():
+            year = int(ts[:4])
+        result[cid] = (ts, year)
+    return result
 
-        log("Scanning versions.csv for default versions ...")
-        default_version_ids = {int(row["version_id"]) for row in default_versions_rows}
-        versions_member = find_member(tar, "versions.csv")
-        if versions_member is None:
-            raise RuntimeError("Could not find versions.csv in DB dump.")
-        version_meta_by_id: Dict[int, Tuple[Optional[int], Optional[int]]] = {}
-        vf = tar.extractfile(versions_member)
-        if vf is None:
-            raise RuntimeError("Could not extract versions.csv from DB dump.")
-        with io.TextIOWrapper(vf, encoding="utf-8") as vtext:
-            vreader = csv.DictReader(vtext)
-            if vreader.fieldnames is None:
-                raise RuntimeError("versions.csv has no header row.")
-            missing = [c for c in ["id", "created_at", "updated_at"] if c not in vreader.fieldnames]
-            if missing:
-                raise RuntimeError(
-                    f"versions.csv is missing expected columns: {missing}. "
-                    "The DB dump format may have changed; please update the script."
-                )
-            for i, row in enumerate(vreader):
-                try:
-                    vid = int(row["id"])
-                except ValueError:
-                    continue
-                if vid not in default_version_ids:
-                    continue
-                c_year = parse_year(row.get("created_at"))
-                u_year = parse_year(row.get("updated_at"))
-                version_meta_by_id[vid] = (c_year, u_year)
-                # 可选：每隔几十万行打个点，这里先省略
 
-    log("Building in-memory indexes ...")
+def load_categories(tf: tarfile.TarFile) -> Tuple[Dict[int, str], Dict[int, List[int]]]:
+    """
+    Load categories.csv and crates_categories.csv:
 
-    crates_by_id: Dict[int, Dict[str, str]] = {}
-    for row in crates_rows:
-        try:
-            cid = int(row["id"])
-        except ValueError:
-            continue
-        crates_by_id[cid] = row
+    Returns:
+      - categories: {category_id: slug}
+      - crate_cats: {crate_id: [category_id, ...]}
+    """
+    log("[sample_crates] Reading categories.csv / crates_categories.csv ...")
 
-    downloads_by_crate_id: Dict[int, int] = defaultdict(int)
-    for row in crate_downloads_rows:
-        try:
-            cid = int(row["crate_id"])
-            dl = int(row["downloads"])
-        except ValueError:
-            continue
-        downloads_by_crate_id[cid] += dl
+    # categories.csv
+    cat_member = find_member(tf, "categories.csv")
+    categories: Dict[int, str] = {}
+    with tf.extractfile(cat_member) as f:
+        reader = csv.DictReader((line.decode("utf-8") for line in f))
+        for row in reader:
+            try:
+                cid = int(row["id"])
+            except (KeyError, ValueError):
+                continue
+            slug = row.get("slug", "") or ""
+            categories[cid] = slug
 
-    categories_by_id: Dict[int, str] = {}
-    for row in categories_rows:
-        try:
-            cat_id = int(row["id"])
-        except ValueError:
-            continue
-        slug = row.get("slug") or ""
-        categories_by_id[cat_id] = slug
+    # crates_categories.csv
+    cc_member = find_member(tf, "crates_categories.csv")
+    crate_cats: Dict[int, List[int]] = defaultdict(list)
+    with tf.extractfile(cc_member) as f:
+        reader = csv.DictReader((line.decode("utf-8") for line in f))
+        for row in reader:
+            try:
+                crate_id = int(row["crate_id"])
+                category_id = int(row["category_id"])
+            except (KeyError, ValueError):
+                continue
+            crate_cats[crate_id].append(category_id)
 
-    crate_to_categories: Dict[int, List[str]] = defaultdict(list)
-    for row in crates_categories_rows:
-        try:
-            cid = int(row["crate_id"])
-            cat_id = int(row["category_id"])
-        except ValueError:
-            continue
-        slug = categories_by_id.get(cat_id)
-        if slug:
-            crate_to_categories[cid].append(slug)
+    return categories, crate_cats
 
-    crate_to_default_version_id: Dict[int, int] = {}
-    for row in default_versions_rows:
-        try:
-            cid = int(row["crate_id"])
-            vid = int(row["version_id"])
-        except ValueError:
-            continue
-        crate_to_default_version_id[cid] = vid
 
-    log("Metadata loaded.")
-    return (
-        crates_by_id,
-        downloads_by_crate_id,
-        crate_to_categories,
-        crate_to_default_version_id,
-        version_meta_by_id,
+def get_top_category(crate_id: int, categories: Dict[int, str], crate_cats: Dict[int, List[int]]) -> str:
+    """
+    Choose a primary top-level category for a crate:
+      - If it has categories, pick the first category_id (arbitrary but stable),
+        take its slug, and then slug.split("::", 1)[0] as the top-level.
+      - If no categories, return "uncategorized".
+    """
+    cat_ids = crate_cats.get(crate_id)
+    if not cat_ids:
+        return "uncategorized"
+    # Arbitrary but deterministic: pick the first one
+    first_cid = cat_ids[0]
+    slug = categories.get(first_cid, "") or ""
+    if not slug:
+        return "uncategorized"
+    return slug.split("::", 1)[0]
+
+
+def quantiles(sorted_values: List[int], ps: List[float]) -> Dict[float, float]:
+    """
+    Compute empirical quantiles on sorted list.
+    """
+    n = len(sorted_values)
+    if n == 0:
+        return {p: float("nan") for p in ps}
+    result: Dict[float, float] = {}
+    for p in ps:
+        if p <= 0:
+            result[p] = float(sorted_values[0])
+        elif p >= 1:
+            result[p] = float(sorted_values[-1])
+        else:
+            idx = p * (n - 1)
+            lo = math.floor(idx)
+            hi = math.ceil(idx)
+            if lo == hi:
+                result[p] = float(sorted_values[lo])
+            else:
+                w = idx - lo
+                result[p] = sorted_values[lo] * (1 - w) + sorted_values[hi] * w
+    return result
+
+
+def format_int(n: int) -> str:
+    return f"{n:,}"
+
+
+def load_core_list(path: str) -> set:
+    """
+    Load a CSV with at least a 'name' column of crate names.
+    Ignoring other columns.
+    """
+    core_names = set()
+    with open(path, "r", encoding="utf-8") as f:
+        # Try to detect delimiter quickly
+        first_line = f.readline()
+        if not first_line:
+            return core_names
+        delim = "\t" if "\t" in first_line and "," not in first_line else ","
+        f.seek(0)
+        reader = csv.DictReader(f, delimiter=delim)
+        if "name" not in reader.fieldnames:
+            raise ValueError(f"--core-list {path} must have a 'name' column")
+        for row in reader:
+            name = (row.get("name") or "").strip()
+            if name:
+                core_names.add(name)
+    return core_names
+
+
+def allocate_strata_sample_sizes(
+    strata_counts: Dict[Tuple[str, str], int],
+    target: int,
+) -> Dict[Tuple[str, str], int]:
+    """
+    Given population counts per stratum and a total target size,
+    compute how many samples to take from each stratum, proportional to their size.
+
+    Uses floor(quota) + distributing leftover by largest fractional parts.
+    """
+    total = sum(strata_counts.values())
+    if total == 0 or target <= 0:
+        return {s: 0 for s in strata_counts}
+
+    quotas: Dict[Tuple[str, str], float] = {}
+    base_counts: Dict[Tuple[str, str], int] = {}
+    remainders: List[Tuple[float, Tuple[str, str]]] = []
+
+    for s, n in strata_counts.items():
+        q = target * (n / total)
+        quotas[s] = q
+        b = int(math.floor(q))
+        base_counts[s] = min(b, n)  # cannot exceed population
+        remainders.append((q - b, s))
+
+    assigned = sum(base_counts.values())
+    leftover = target - assigned
+
+    # Distribute leftover to strata with largest fractional parts,
+    # while respecting population size.
+    remainders.sort(reverse=True, key=lambda x: x[0])
+
+    i = 0
+    while leftover > 0 and i < len(remainders):
+        frac, s = remainders[i]
+        if frac <= 0:
+            break
+        if base_counts[s] < strata_counts[s]:
+            base_counts[s] += 1
+            leftover -= 1
+        i += 1
+        if i == len(remainders) and leftover > 0:
+            # Loop again if we still have leftover; this is rare.
+            i = 0
+
+    # Final sanity: cap at population
+    for s, n in strata_counts.items():
+        if base_counts[s] > n:
+            base_counts[s] = n
+
+    return base_counts
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dump", required=True, help="Path to crates.io db-dump.tar.gz")
+    ap.add_argument("--out", required=True, help="Output CSV for sampled crates")
+    ap.add_argument(
+        "--target-size",
+        type=int,
+        default=1500,
+        help="Total desired sample size (core + non-core), default 1500",
+    )
+    ap.add_argument(
+        "--core-top-revdeps",
+        type=int,
+        default=300,
+        help="Number of top crates by reverse deps to include in core stratum",
+    )
+    ap.add_argument(
+        "--core-list",
+        help="Optional CSV with a 'name' column listing extra core crates (e.g., heavy nightly users)",
+    )
+    ap.add_argument(
+        "--min-downloads-noncore",
+        type=int,
+        default=100,
+        help="Minimum total downloads for non-core candidates (default 100)",
+    )
+    ap.add_argument(
+        "--min-latest-year-noncore",
+        type=int,
+        default=2015,
+        help="Minimum latest version year for non-core candidates (default 2015)",
+    )
+    ap.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for non-core sampling (default 42)",
     )
 
+    args = ap.parse_args()
 
-# ---------- 构建候选集合 ----------
+    log("[sample_crates] Starting two-layer sampling pipeline ...")
+    log(f"[sample_crates] Opening DB dump: {args.dump}")
+    tf = tarfile.open(args.dump, "r:gz")
 
-def build_candidate_crates(
-    crates_by_id,
-    downloads_by_crate_id,
-    crate_to_categories,
-    crate_to_default_version_id,
-    version_meta_by_id,
-    min_year: int,
-    min_downloads: int,
-    require_github: bool = True,
-):
-    """根据过滤条件构建候选 crate 列表。"""
-    log(f"Building candidate set with min_year={min_year}, min_downloads={min_downloads} ...")
-    candidates: List[CrateMeta] = []
+    # Load base data
+    crates = load_crates(tf)
+    downloads = load_downloads(tf)
+    revdeps = load_reverse_deps(tf)
+    latest_map = load_versions_latest_year(tf)
+    categories, crate_cats = load_categories(tf)
 
-    for cid, crate_row in crates_by_id.items():
-        name = crate_row.get("name") or ""
-        repo = (crate_row.get("repository") or "").strip()
-
-        # 1) 只要 GitHub 仓库
-        if require_github:
-            repo_lower = repo.lower()
-            if "github.com" not in repo_lower:
-                continue
-
-        # 2) 下载量过滤
-        downloads = downloads_by_crate_id.get(cid, 0)
-        if downloads < min_downloads:
-            continue
-
-        # 3) 时间过滤：优先用 default version 的 created/updated 年份
-        created_year = None
-        updated_year = None
-        vid = crate_to_default_version_id.get(cid)
-        if vid is not None and vid in version_meta_by_id:
-            created_year, updated_year = version_meta_by_id[vid]
-        if created_year is None:
-            created_year = parse_year(crate_row.get("created_at"))
-        if updated_year is None:
-            updated_year = parse_year(crate_row.get("updated_at"))
-
-        year_for_filter = updated_year or created_year
-        if year_for_filter is None or year_for_filter < min_year:
-            continue
-
-        # 4) 分类：取一个“顶级 category”（slug 的前半段）
-        cats = crate_to_categories.get(cid, [])
-        if cats:
-            top_cats = sorted({c.split("::", 1)[0] for c in cats})
-            top_category = top_cats[0]
-            all_categories = ",".join(sorted(cats))
-        else:
-            top_category = "uncategorized"
-            all_categories = ""
-
-        candidates.append(
+    # Build metrics for all crates
+    log("[sample_crates] Building crate metrics ...")
+    all_meta: List[CrateMeta] = []
+    for cid, cinfo in crates.items():
+        name = cinfo["name"]
+        created_at = cinfo.get("created_at", "") or ""
+        repo = cinfo.get("repository", "") or ""
+        dl = downloads.get(cid, 0)
+        rd = revdeps.get(cid, 0)
+        latest_created_at, latest_year = latest_map.get(cid, ("", None))
+        top_cat = get_top_category(cid, categories, crate_cats)
+        all_meta.append(
             CrateMeta(
                 crate_id=cid,
                 name=name,
                 repository=repo,
-                downloads=downloads,
-                top_category=top_category,
-                all_categories=all_categories,
-                created_year=created_year,
-                updated_year=updated_year,
-                pop_stratum="",
+                created_at=created_at,
+                latest_version_created_at=latest_created_at,
+                latest_version_year=latest_year,
+                downloads=dl,
+                revdeps=rd,
+                top_category=top_cat,
             )
         )
 
-    log(f"Candidate crates after filters: {len(candidates)}")
-    return candidates
+    total_crates = len(all_meta)
+    log(f"[sample_crates] Total crates in dump: {format_int(total_crates)}")
 
+    # --- Core stratum: top by reverse deps + optional core list ---
 
-def assign_pop_strata(candidates: List[CrateMeta]):
-    """给每个候选 crate 按下载量打 high / mid / low 标签。"""
-    if not candidates:
+    # Sort by revdeps descending
+    sorted_by_revdeps = sorted(all_meta, key=lambda m: m.revdeps, reverse=True)
+    core_by_revdeps = [
+        m for m in sorted_by_revdeps if m.revdeps > 0
+    ][: args.core_top_revdeps]
+
+    core_ids = {m.crate_id for m in core_by_revdeps}
+    core_names_set = {m.name for m in core_by_revdeps}
+
+    if args.core_list:
+        log(f"[sample_crates] Loading extra core names from {args.core_list} ...")
+        extra_names = load_core_list(args.core_list)
+        core_names_set |= extra_names
+
+        # Expand core_ids based on names
+        name_to_meta = {m.name: m for m in all_meta}
+        for nm in extra_names:
+            m = name_to_meta.get(nm)
+            if m:
+                core_ids.add(m.crate_id)
+
+    core_meta = [m for m in all_meta if m.crate_id in core_ids]
+    core_size = len(core_meta)
+    log(f"[sample_crates] Core stratum size: {format_int(core_size)} crates")
+
+    # --- Non-core candidate pool ---
+
+    rnd = random.Random(args.seed)
+
+    noncore_all = [m for m in all_meta if m.crate_id not in core_ids]
+
+    # Apply filters: min downloads and recency
+    noncore_candidates: List[CrateMeta] = []
+    for m in noncore_all:
+        if m.downloads < args.min_downloads_noncore:
+            continue
+        if m.latest_version_year is not None and m.latest_version_year < args.min_latest_year_noncore:
+            continue
+        # If latest_version_year is None (we didn't see versions), we keep it for now.
+        noncore_candidates.append(m)
+
+    nc_total = len(noncore_candidates)
+    log(
+        f"[sample_crates] Non-core candidates after filters "
+        f"(downloads >= {args.min_downloads_noncore}, latest_year >= {args.min_latest_year_noncore} if known): "
+        f"{format_int(nc_total)} crates"
+    )
+
+    if nc_total == 0:
+        log("[sample_crates] WARNING: No non-core candidates after filters. Output will contain only core crates.")
+
+    # If target size is smaller than core size, we just output all cores.
+    if args.target_size <= core_size:
+        log(
+            "[sample_crates] Target size <= core size; "
+            "output will contain only core stratum (no non-core sample)."
+        )
+        sampled = core_meta
+        # Write output and exit
+        with open(args.out, "w", newline="", encoding="utf-8") as f_out:
+            writer = csv.writer(f_out)
+            writer.writerow(
+                [
+                    "crate_id",
+                    "name",
+                    "repository",
+                    "downloads",
+                    "revdeps",
+                    "top_category",
+                    "popularity_band",
+                    "is_core",
+                    "stratum",
+                    "created_at",
+                    "latest_version_created_at",
+                    "latest_version_year",
+                ]
+            )
+            for m in sampled:
+                writer.writerow(
+                    [
+                        m.crate_id,
+                        m.name,
+                        m.repository,
+                        m.downloads,
+                        m.revdeps,
+                        m.top_category,
+                        "n/a",
+                        1,
+                        "core",
+                        m.created_at,
+                        m.latest_version_created_at,
+                        m.latest_version_year if m.latest_version_year is not None else "",
+                    ]
+                )
+        log(f"[sample_crates] Sample CSV written to {args.out}")
+        log(
+            f"[sample_crates] FINAL SUMMARY: total sampled crates = {format_int(len(sampled))} "
+            f"(core only)"
+        )
         return
 
-    sorted_dl = sorted(c.downloads for c in candidates)
-    n = len(sorted_dl)
+    # --- Popularity bands on non-core candidates ---
 
-    def q(p: float) -> int:
-        if n == 1:
-            return sorted_dl[0]
-        idx = int(p * (n - 1))
-        return sorted_dl[idx]
+    dl_values_nc = sorted(m.downloads for m in noncore_candidates)
+    q_nc = quantiles(dl_values_nc, [0.5, 0.9])
+    q50_nc = q_nc[0.5]
+    q90_nc = q_nc[0.9]
+    log(
+        "[sample_crates] Non-core downloads quantiles: "
+        f"p50={format_int(int(q50_nc))}, p90={format_int(int(q90_nc))}"
+    )
 
-    q50 = q(0.5)
-    q80 = q(0.8)
-    log(f"Download quantiles: q50={q50}, q80={q80}")
-
-    for c in candidates:
-        if c.downloads >= q80:
-            c.pop_stratum = "high"
-        elif c.downloads >= q50:
-            c.pop_stratum = "mid"
+    def get_pop_band(dl: int) -> str:
+        if dl < q50_nc:
+            return "low"
+        elif dl < q90_nc:
+            return "mid"
         else:
-            c.pop_stratum = "low"
+            return "high"
 
+    # Count population per stratum (top_category, pop_band)
+    strata_counts: Dict[Tuple[str, str], int] = defaultdict(int)
+    for m in noncore_candidates:
+        band = get_pop_band(m.downloads)
+        strata_counts[(m.top_category, band)] += 1
 
-def stratified_sample(candidates: List[CrateMeta], target_size: int, seed: int) -> List[CrateMeta]:
-    """按 (top_category, pop_stratum) 分层抽样。"""
-    random.seed(seed)
-    if len(candidates) <= target_size:
-        log(f"Candidates ({len(candidates)}) <= target_size ({target_size}), no sampling needed.")
-        return list(candidates)
+    # Determine non-core target size
+    target_noncore = args.target_size - core_size
+    if target_noncore > nc_total:
+        log(
+            f"[sample_crates] WARNING: target non-core size {target_noncore} "
+            f"exceeds candidate pool {nc_total}. We will take all non-core candidates."
+        )
+        target_noncore = nc_total
 
-    strata: Dict[Tuple[str, str], List[CrateMeta]] = defaultdict(list)
-    for c in candidates:
-        key = (c.top_category, c.pop_stratum)
-        strata[key].append(c)
+    log(
+        f"[sample_crates] Target non-core sample size: {format_int(target_noncore)} "
+        f"(given total target {format_int(args.target_size)})"
+    )
 
-    total = len(candidates)
-    log(f"Strata count: {len(strata)}")
-    sampled: List[CrateMeta] = []
+    # Allocate sample sizes per stratum
+    strata_sample_sizes = allocate_strata_sample_sizes(strata_counts, target_noncore)
 
-    for key, items in strata.items():
-        frac = len(items) / total
-        k = int(round(frac * target_size))
-        if k < 3 and len(items) >= 3:
-            k = 3
-        if k > len(items):
-            k = len(items)
-        if k == 0:
+    # Build index of candidates by stratum
+    strata_members: Dict[Tuple[str, str], List[CrateMeta]] = defaultdict(list)
+    for m in noncore_candidates:
+        band = get_pop_band(m.downloads)
+        strata_members[(m.top_category, band)].append(m)
+
+    # Sample within each stratum
+    sampled_noncore: List[CrateMeta] = []
+    for s, n_pop in strata_counts.items():
+        n_sample = strata_sample_sizes.get(s, 0)
+        if n_sample <= 0:
             continue
-        chosen = random.sample(items, k)
-        sampled.extend(chosen)
+        members = strata_members[s]
+        if n_sample >= len(members):
+            # Take all
+            chosen = members
+        else:
+            chosen = rnd.sample(members, n_sample)
+        sampled_noncore.extend(chosen)
 
-    if len(sampled) > target_size:
-        log(f"Oversampled {len(sampled)} > {target_size}, trimming down.")
-        sampled = random.sample(sampled, target_size)
-    elif len(sampled) < target_size:
-        need = target_size - len(sampled)
-        log(f"Sampled {len(sampled)} < {target_size}, filling with extra {need}.")
-        remaining = [c for c in candidates if c not in sampled]
-        need = min(need, len(remaining))
-        sampled.extend(random.sample(remaining, need))
+    # Sanity: cap / truncate 以防 rounding 偶尔多出一两个
+    if len(sampled_noncore) > target_noncore:
+        sampled_noncore = sampled_noncore[:target_noncore]
 
-    return sampled
-
-
-def write_sample_csv(sampled: List[CrateMeta], out_path: str):
-    """把抽样结果写成 CSV。"""
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    fieldnames = [
-        "crate_id",
-        "name",
-        "repository",
-        "downloads",
-        "top_category",
-        "all_categories",
-        "created_year",
-        "updated_year",
-        "pop_stratum",
-    ]
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for c in sampled:
-            writer.writerow(asdict(c))
-    log(f"Sample CSV written to {out_path}")
-
-
-def print_summary(candidates: List[CrateMeta], sampled: List[CrateMeta]):
-    """在控制台上打印摘要。"""
-    print()
-    print("===== SAMPLING SUMMARY =====")
-    print(f"Total candidate crates after filters: {len(candidates)}")
-    print(f"Sample size: {len(sampled)}")
-
-    cat_counts = Counter(c.top_category for c in sampled)
-    print("\nTop-level categories in sample (top 15):")
-    for cat, count in cat_counts.most_common(15):
-        print(f"  {cat:25s} {count:4d}")
-
-    pop_counts = Counter(c.pop_stratum for c in sampled)
-    print("\nPopularity strata in sample:")
-    for s, count in sorted(pop_counts.items()):
-        print(f"  {s:6s}: {count}")
-    print("============================")
-
-
-# ---------- 主入口 ----------
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(
-        description="Stratified sample of crates.io crates (GitHub-backed) from DB dump."
+    total_sampled = core_size + len(sampled_noncore)
+    log(
+        f"[sample_crates] Sample sizes: core={format_int(core_size)}, "
+        f"non-core={format_int(len(sampled_noncore))}, total={format_int(total_sampled)}"
     )
-    parser.add_argument(
-        "--dump",
-        required=True,
-        help="Path to crates.io DB dump tar.gz "
-             "(download from https://static.crates.io/db-dump.tar.gz)",
-    )
-    parser.add_argument(
-        "--out",
-        default="sampled_crates.csv",
-        help="Output CSV path (default: sampled_crates.csv)",
-    )
-    parser.add_argument(
-        "--target-size",
-        type=int,
-        default=700,
-        help="Target sample size (default: 700)",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed (default: 42)",
-    )
-    parser.add_argument(
-        "--min-year",
-        type=int,
-        default=2020,
-        help="Minimum activity year (default: 2020)",
-    )
-    parser.add_argument(
-        "--min-downloads",
-        type=int,
-        default=100,
-        help="Minimum total downloads (default: 100)",
-    )
-    args = parser.parse_args(argv)
 
-    log("Starting sampling pipeline ...")
+    # --- Write output CSV ---
 
-    try:
-        (
-            crates_by_id,
-            downloads_by_crate_id,
-            crate_to_categories,
-            crate_to_default_version_id,
-            version_meta_by_id,
-        ) = load_metadata_from_dump(args.dump)
-    except Exception as e:
-        print("FATAL: could not load metadata from DB dump.", file=sys.stderr)
-        print(f"Reason: {e}", file=sys.stderr)
-        print(
-            "\nHow to fix:\n"
-            "1. Ensure you downloaded the official DB dump:\n"
-            "   curl -L -o db-dump.tar.gz https://static.crates.io/db-dump.tar.gz\n"
-            "2. Re-run this script with:  --dump ./db-dump.tar.gz\n"
-            "3. If the error persists, inspect the CSVs inside the tarball "
-            "   and update column names in the script.",
-            file=sys.stderr,
+    with open(args.out, "w", newline="", encoding="utf-8") as f_out:
+        writer = csv.writer(f_out)
+        writer.writerow(
+            [
+                "crate_id",
+                "name",
+                "repository",
+                "downloads",
+                "revdeps",
+                "top_category",
+                "popularity_band",
+                "is_core",
+                "stratum",
+                "created_at",
+                "latest_version_created_at",
+                "latest_version_year",
+            ]
         )
-        sys.exit(1)
 
-    candidates = build_candidate_crates(
-        crates_by_id=crates_by_id,
-        downloads_by_crate_id=downloads_by_crate_id,
-        crate_to_categories=crate_to_categories,
-        crate_to_default_version_id=crate_to_default_version_id,
-        version_meta_by_id=version_meta_by_id,
-        min_year=args.min_year,
-        min_downloads=args.min_downloads,
-    )
+        # Core first
+        for m in core_meta:
+            writer.writerow(
+                [
+                    m.crate_id,
+                    m.name,
+                    m.repository,
+                    m.downloads,
+                    m.revdeps,
+                    m.top_category,
+                    "n/a",
+                    1,
+                    "core",
+                    m.created_at,
+                    m.latest_version_created_at,
+                    m.latest_version_year if m.latest_version_year is not None else "",
+                ]
+            )
 
-    if not candidates:
-        print(
-            "No candidate crates after applying filters.\n"
-            "Try lowering --min-downloads or --min-year.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        # Non-core
+        for m in sampled_noncore:
+            band = get_pop_band(m.downloads)
+            writer.writerow(
+                [
+                    m.crate_id,
+                    m.name,
+                    m.repository,
+                    m.downloads,
+                    m.revdeps,
+                    m.top_category,
+                    band,
+                    0,
+                    "noncore",
+                    m.created_at,
+                    m.latest_version_created_at,
+                    m.latest_version_year if m.latest_version_year is not None else "",
+                ]
+            )
 
-    assign_pop_strata(candidates)
-    sampled = stratified_sample(candidates, args.target_size, args.seed)
-    write_sample_csv(sampled, args.out)
-    print_summary(candidates, sampled)
-    log("Done.")
+    # --- Print summary info ---
+
+    # Category summary
+    cat_counts_core: Dict[str, int] = defaultdict(int)
+    cat_counts_nc: Dict[str, int] = defaultdict(int)
+    for m in core_meta:
+        cat_counts_core[m.top_category] += 1
+    for m in sampled_noncore:
+        cat_counts_nc[m.top_category] += 1
+
+    log("\n===== SAMPLING SUMMARY =====")
+    log(f"Total crates in dump         : {format_int(total_crates)}")
+    log(f"Core stratum size            : {format_int(core_size)}")
+    log(f"Non-core candidate pool size : {format_int(nc_total)}")
+    log(f"Non-core sampled             : {format_int(len(sampled_noncore))}")
+    log(f"TOTAL SAMPLED                : {format_int(total_sampled)}")
+
+    log("\nTop-level categories in core sample (top 15):")
+    for cat, cnt in sorted(cat_counts_core.items(), key=lambda x: x[1], reverse=True)[:15]:
+        log(f"  {cat:<25} {cnt:5d}")
+
+    log("\nTop-level categories in non-core sample (top 15):")
+    for cat, cnt in sorted(cat_counts_nc.items(), key=lambda x: x[1], reverse=True)[:15]:
+        log(f"  {cat:<25} {cnt:5d}")
+
+    log("============================")
+    log(f"[sample_crates] Sample CSV written to {args.out}")
+    log("[sample_crates] Done.")
 
 
 if __name__ == "__main__":
