@@ -31,6 +31,7 @@ Outputs:
 import os
 import sqlite3
 import csv
+import argparse
 from datetime import datetime
 from statistics import mean, median
 
@@ -366,20 +367,36 @@ def category_summary(conn: sqlite3.Connection, out_dir: str):
 
 
 def main():
-    ensure_out_dir(OUT_DIR)
+    ap = argparse.ArgumentParser(description="Analyze features DB and dump CSV summaries.")
+    ap.add_argument(
+        "--db",
+        default=DB_PATH,
+        help=f"Path to SQLite database (default: {DB_PATH})",
+    )
+    ap.add_argument(
+        "--out-dir",
+        default=OUT_DIR,
+        help=f"Output directory for CSVs (default: {OUT_DIR})",
+    )
+    args = ap.parse_args()
 
-    if not os.path.exists(DB_PATH):
-        print(f"ERROR: {DB_PATH} not found. Run scan_features.py and scan_history.py first.")
+    db_path = args.db
+    out_dir = args.out_dir
+
+    ensure_out_dir(out_dir)
+
+    if not os.path.exists(db_path):
+        print(f"ERROR: {db_path} not found. Run scan_features.py and scan_history.py first.")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(db_path)
 
     try:
         basic_overview(conn)
-        feature_head_summary(conn, OUT_DIR)
-        feature_history_summary(conn, OUT_DIR)
-        feature_lifetimes(conn, OUT_DIR)
-        category_summary(conn, OUT_DIR)
+        feature_head_summary(conn, out_dir)
+        feature_history_summary(conn, out_dir)
+        feature_lifetimes(conn, out_dir)
+        category_summary(conn, out_dir)
     finally:
         conn.close()
 

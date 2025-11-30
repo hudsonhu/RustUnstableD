@@ -37,6 +37,7 @@ import tarfile
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
+from urllib.parse import urlparse
 
 # Avoid "field larger than field limit" on crates.csv descriptions
 csv.field_size_limit(2**31 - 1)
@@ -250,6 +251,55 @@ def format_int(n: int) -> str:
     return f"{n:,}"
 
 
+def parse_github_repo(repository: str) -> Optional[Tuple[str, str]]:
+    """
+    Parse a repository string and see if it is a GitHub repo.
+    Returns (owner, repo) if valid, else None.
+    """
+    if not repository:
+        return None
+    s = repository.strip()
+
+    # SSH form: git@github.com:owner/repo.git
+    if s.startswith("git@github.com:"):
+        tail = s[len("git@github.com:"):]
+        tail = tail.split("#", 1)[0].split("?", 1)[0]
+        if tail.endswith(".git"):
+            tail = tail[:-4]
+        parts = tail.strip("/").split("/")
+        if len(parts) < 2:
+            return None
+        return parts[0], parts[1]
+
+    lower = s.lower()
+    if "github.com" not in lower:
+        return None
+
+    if not (s.startswith("http://") or s.startswith("https://")
+            or s.startswith("git://") or s.startswith("ssh://")):
+        s = "https://" + s.lstrip("/")
+
+    parsed = urlparse(s)
+    host = parsed.netloc.lower()
+    path = parsed.path
+
+    if "github.com" not in host:
+        if parsed.netloc == "" and parsed.path.startswith("github.com/"):
+            path = parsed.path[len("github.com") + 1:]
+        else:
+            return None
+
+    parts = path.strip("/").split("/")
+    if len(parts) < 2:
+        return None
+    owner, repo = parts[0], parts[1]
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    if not owner or not repo:
+        return None
+    return owner, repo
+
+
 def load_core_list(path: str) -> set:
     """
     Load a CSV with at least a 'name' column of crate names.
@@ -380,31 +430,58 @@ def main():
 
     # Build metrics for all crates
     log("[sample_crates] Building crate metrics ...")
-    all_meta: List[CrateMeta] = []
+    repo_best: Dict[str, CrateMeta] = {}
+    invalid_repo = 0
+    dup_repo = 0
     for cid, cinfo in crates.items():
         name = cinfo["name"]
         created_at = cinfo.get("created_at", "") or ""
         repo = cinfo.get("repository", "") or ""
+        parsed_repo = parse_github_repo(repo)
+        if parsed_repo is None:
+            invalid_repo += 1
+            continue
+        repo_key = f"{parsed_repo[0]}/{parsed_repo[1]}"
         dl = downloads.get(cid, 0)
         rd = revdeps.get(cid, 0)
         latest_created_at, latest_year = latest_map.get(cid, ("", None))
         top_cat = get_top_category(cid, categories, crate_cats)
-        all_meta.append(
-            CrateMeta(
-                crate_id=cid,
-                name=name,
-                repository=repo,
-                created_at=created_at,
-                latest_version_created_at=latest_created_at,
-                latest_version_year=latest_year,
-                downloads=dl,
-                revdeps=rd,
-                top_category=top_cat,
-            )
+        meta = CrateMeta(
+            crate_id=cid,
+            name=name,
+            repository=repo,
+            created_at=created_at,
+            latest_version_created_at=latest_created_at,
+            latest_version_year=latest_year,
+            downloads=dl,
+            revdeps=rd,
+            top_category=top_cat,
         )
+        prev = repo_best.get(repo_key)
+        if prev is None:
+            repo_best[repo_key] = meta
+        else:
+            dup_repo += 1
+            # Keep the crate with larger revdeps, then downloads as tiebreaker.
+            if (meta.revdeps, meta.downloads) > (prev.revdeps, prev.downloads):
+                repo_best[repo_key] = meta
+
+    all_meta: List[CrateMeta] = list(repo_best.values())
 
     total_crates = len(all_meta)
     log(f"[sample_crates] Total crates in dump: {format_int(total_crates)}")
+    if invalid_repo:
+        log(f"[sample_crates] Skipped crates with invalid/non-GitHub repository: {format_int(invalid_repo)}")
+    if dup_repo:
+        log(f"[sample_crates] Collapsed duplicate repositories to unique set: {format_int(dup_repo)} duplicates dropped")
+
+    # If target size exceeds available unique repos, cap it.
+    if args.target_size > total_crates:
+        log(
+            f"[sample_crates] WARNING: target size {format_int(args.target_size)} "
+            f"exceeds unique GitHub repos {format_int(total_crates)}; capping target."
+        )
+        args.target_size = total_crates
 
     # --- Core stratum: top by reverse deps + optional core list ---
 

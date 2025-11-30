@@ -600,6 +600,9 @@ def main(argv=None):
         if status_map:
             if st == "success":
                 to_scan.append(job)
+            elif st in ("pending", "unknown", "") and os.path.isdir(job.local_path):
+                # Missing/unknown status but repo exists locally; include it.
+                to_scan.append(job)
             elif args.include_failed and os.path.isdir(job.local_path):
                 to_scan.append(job)
         else:
