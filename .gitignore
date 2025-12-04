@@ -4,3 +4,4 @@ Cargo.lock
 *.tmp
 repos/
 .DS_Store
+rust/
