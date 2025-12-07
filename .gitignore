@@ -2,6 +2,25 @@ target/
 Cargo.lock
 *.log
 *.tmp
-repos/
+*.py[cod]
+__pycache__/
 .DS_Store
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Local clones and vendored repos
+repos/
 rust/
+
+# Large datasets and generated artifacts
+db-dump.tar.gz
+features_head_v*.db*
+analysis_outputs/
+analysis_final_outputs/
+repo_commit_counts.csv
+download_status*.csv
+sampled_crates_*.csv
+evolution_sample_*.csv
+feature_timeline.csv
+feature_timeline_deep.csv
